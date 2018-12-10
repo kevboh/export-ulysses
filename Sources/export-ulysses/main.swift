@@ -80,7 +80,12 @@ class Parser: NSObject, XMLParserDelegate {
                 .replacingOccurrences(of: "/", with: "-")
                 .replacingOccurrences(of: "\\", with: "")
                 .replacingOccurrences(of: ":", with: " - ")
-            let destination = self.to.deletingLastPathComponent().appendingPathComponent(cleanTitle).appendingPathExtension("markdown")
+            var destination = self.to.deletingLastPathComponent().appendingPathComponent(cleanTitle).appendingPathExtension("txt")
+            var version = 0
+            while Parser.parserManager.fileExists(atPath: destination.path.removingPercentEncoding ?? destination.path) {
+                version += 1
+                destination = destination.deletingLastPathComponent().appendingPathComponent("\(cleanTitle) (\(version))").appendingPathExtension("txt")
+            }
             do {
                 try Parser.parserManager.moveItem(atPath: self.to.path, toPath: destination.path.removingPercentEncoding ?? destination.path)
                 wroteTo = destination
@@ -141,44 +146,49 @@ class Parser: NSObject, XMLParserDelegate {
         let currentKind = currentTag?.attributes["kind"]
         let parent = tags.count >= 2 ? tags[tags.count - 2] : nil
 
+        let str = string
+            .replacingOccurrences(of: "&amp;gt;", with: ">")
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&lt;", with: "<")
+
         switch currentTag?.name {
         case "p":
-            if waitingForTitle {
-                self.title = (self.title ?? "").appending(string)
-            }
+            saveTitle(str)
             writingBegan = true
-            writeString(string)
+            writeString(str)
         case "tag":
-            writeString(string)
+            writeString(str)
         case "attribute" where currentTag?.attributes["identifier"] == "URL":
-            self.currentLink.append(contentsOf: string)
+            self.currentLink.append(contentsOf: str)
         case "attribute" where currentTag?.attributes["identifier"] == "title" &&
             (parent?.attributes["kind"] == "link" || parent?.attributes["kind"] == "image"):
             break
         case "attribute" where currentTag?.attributes["identifier"] == "image" &&
             parent?.attributes["kind"] == "image":
-            writeString("(image with ID \(string))")
+            writeString("(image with ID \(str))")
             break
         case "element" where currentKind == "link":
-            writeString("[\(string)](\(self.currentLink))")
+            saveTitle(str)
+            writeString("[\(str)](\(self.currentLink))")
         case "element" where currentKind == "strong":
-            writeString("**\(string)**")
+            writeString("**\(str)**")
         case "element" where currentKind == "emph":
-            writeString("_\(string)_")
+            writeString("_\(str)_")
         case "element" where currentKind == "code":
-            writeString("`\(string)`")
+            writeString("`\(str)`")
         case "element" where currentKind == "inlineNative":
-            writeString("```\(string)```")
+            writeString("```\(str)```")
         case "element" where currentKind == "delete":
-            writeString("~~\(string)~~")
+            writeString("~~\(str)~~")
         case "element" where currentKind == "annotation":
-            writeString("\(string): ")
+            writeString("\(str): ")
         case "attachment" where currentTag?.attributes["type"] == "keywords":
-            keywords += string
+            keywords += str
         case "attachment" where currentTag?.attributes["type"] == "file":
-            attachments += string
+            attachments += str
         case "escape":
-            let unescaped = string.replacingOccurrences(of: "\\", with: "")
+            let unescaped = str.replacingOccurrences(of: "\\", with: "")
             if (parent?.attributes["kind"] == "link") {
                 self.currentLink.append(contentsOf: unescaped)
             }
@@ -194,6 +204,28 @@ class Parser: NSObject, XMLParserDelegate {
             print(parent?.attributes ?? [:])
             fatalError("unknown tag")
             break
+        }
+    }
+
+    private func saveTitle(_ string: String) {
+        guard waitingForTitle || self.title == nil else { return }
+
+        var formattedTitle = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        if formattedTitle.starts(with: ".") {
+            formattedTitle = "> \(formattedTitle)"
+        }
+        guard formattedTitle != "&" else { return }
+        if waitingForTitle {
+            self.title = (self.title ?? "").appending(formattedTitle)
+        }
+        else if self.title == nil {
+            var words = formattedTitle.split(separator: " ")
+            var titleBuilder = ""
+            while titleBuilder.count < 80 && !words.isEmpty {
+                let word = words.removeFirst()
+                titleBuilder += word + " "
+            }
+            self.title = String(titleBuilder.trimmingCharacters(in: .whitespacesAndNewlines))
         }
     }
 
@@ -220,7 +252,7 @@ var sheetTotal = 0;
 var parsers: [String: Parser] = [:]
 let KeysToFetch: [URLResourceKey] = [.isDirectoryKey, .creationDateKey, .contentModificationDateKey]
 
-func crawl(_ url: URL, output: String, preservingFolders: Bool = false, withMeta: Bool = true, onFoundDirectory: ((String) -> Void)? = nil) {
+func crawl(_ url: URL, output: String, preservingFolders: Bool = false, withMeta: Bool = true, ignoringFolders: [String], onFoundDirectory: ((String) -> Void)? = nil) {
     vprint("Scanning \(url)...")
     let outputURL = URL(fileURLWithPath: output)
     let resourceValues = try? url.resourceValues(forKeys: Set(KeysToFetch))
@@ -232,7 +264,7 @@ func crawl(_ url: URL, output: String, preservingFolders: Bool = false, withMeta
             let fileName = url.deletingPathExtension().lastPathComponent
             let key = UUID().uuidString
             let from = url.appendingPathComponent("Content.xml")
-            let to = outputURL.appendingPathComponent("\(fileName).markdown")
+            let to = outputURL.appendingPathComponent("\(fileName).txt")
             let createdDate = resourceValues?.creationDate ?? Date()
             let modifiedDate = resourceValues?.contentModificationDate ?? Date()
             let onComplete = { key in
@@ -278,20 +310,24 @@ func crawl(_ url: URL, output: String, preservingFolders: Bool = false, withMeta
                 }
             }
 
-            let newOutput = preservingFolders ? outputURL.appendingPathComponent(name) : outputURL
-            try? fileManager.createDirectory(at: newOutput, withIntermediateDirectories: true, attributes: nil)
-            let newOutputPath = newOutput.path
+            // Ignore matching groups
+            if !ignoringFolders.contains(name) {
+                // Process and crawl group
+                let newOutput = preservingFolders ? outputURL.appendingPathComponent(name) : outputURL
+                try? fileManager.createDirectory(at: newOutput, withIntermediateDirectories: true, attributes: nil)
+                let newOutputPath = newOutput.path
 
-            onFoundDirectory?(newOutputPath)
+                onFoundDirectory?(newOutputPath)
 
-            for item in results {
-                crawl(item, output: newOutputPath, preservingFolders: preservingFolders, withMeta: withMeta, onFoundDirectory: onFoundDirectory)
+                for item in results {
+                    crawl(item, output: newOutputPath, preservingFolders: preservingFolders, withMeta: withMeta, ignoringFolders: ignoringFolders, onFoundDirectory: onFoundDirectory)
+                }
             }
         }
     }
 }
 
-func run(_ input: String, _ output: String, keepGroups: Bool, skipMeta: Bool) {
+func run(_ input: String, _ output: String, keepGroups: Bool, skipMeta: Bool, ignoring: [String]) {
     print("Starting export...")
 
     // Prep input and output
@@ -318,6 +354,7 @@ note_directories:
           output: outputURL.path,
           preservingFolders: keepGroups,
           withMeta: !skipMeta,
+          ignoringFolders: ignoring,
           onFoundDirectory: { path in
             if keepGroups {
                 let data = [UInt8]("- \"\(path)\"\n".utf8)
@@ -337,10 +374,11 @@ let main = command(
     Argument<String>("output", description: "The path you want to export notes to."),
     Flag("keep-groups", description: "Create directories for each Ulysses Group, and export notes into them."),
     Flag("skip-meta", description: "Don’t append Ulysses keywords, attachment info, create date, and modify date to files. Files will still have the correct system create and modify dates."),
-    Flag("verbose", flag: "v", description: "Log export activity and debugging statements.")
-) { input, output, keepGroups, skipMeta, v in
+    Flag("verbose", flag: "v", description: "Log export activity and debugging statements."),
+    VariadicOption<String>("ignore", description: "Groups to ignore on export")
+) { input, output, keepGroups, skipMeta, v, ignoring in
     verbose = v
-    run(input, output, keepGroups: keepGroups, skipMeta: skipMeta)
+    run(input, output, keepGroups: keepGroups, skipMeta: skipMeta, ignoring: ignoring)
 }
 
 main.run()
